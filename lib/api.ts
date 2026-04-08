@@ -19,107 +19,84 @@ async function get<T>(endpoint: string, params?: Record<string, string>): Promis
   return res.json();
 }
 
-async function post<T>(endpoint: string, body: unknown): Promise<T> {
-  const res = await fetch(`${MCP_URL}${endpoint}`, {
-    method: "POST",
-    headers: { "X-API-Key": API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`);
-  return res.json();
+// ─── Raw Evernote response types ────────────────────────────
+
+interface SemanticHit {
+  noteGuid: string;
+  score: number;
+  chunkContent: string;
 }
 
-async function put<T>(endpoint: string, body: unknown): Promise<T> {
-  const res = await fetch(`${MCP_URL}${endpoint}`, {
-    method: "PUT",
-    headers: { "X-API-Key": API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`);
-  return res.json();
-}
-
-async function del(endpoint: string): Promise<void> {
-  const res = await fetch(`${MCP_URL}${endpoint}`, {
-    method: "DELETE",
-    headers: { "X-API-Key": API_KEY },
-  });
-  if (!res.ok) throw new Error(`API error: ${res.status} ${res.statusText}`);
-}
-
-// ─── Search result → Note mapping ──────────────────────────
-
-interface SearchResult {
-  noteId: string;
-  title: string;
-  snippet?: string;
-  score?: number;
-  notebookId?: string;
-  created?: number;
-  updated?: number;
-}
-
-function searchResultToNote(r: SearchResult): Note {
-  return {
-    id: r.noteId,
-    title: r.title,
-    snippet: r.snippet,
-    notebookId: r.notebookId,
-    created: r.created,
-    updated: r.updated,
-  };
+interface NotesApiResponse {
+  // Current deployed format (raw Evernote response)
+  hits?: Record<string, number>;
+  semanticHits?: SemanticHit[];
+  // Future refactored format
+  notes?: Array<{ noteId: string; title: string; snippet?: string; notebookId?: string; created?: number; updated?: number }>;
 }
 
 // ─── Notes ──────────────────────────────────────────────────
 
+function deriveTitle(content: string): string {
+  // Use first line or first ~60 chars as title
+  const firstLine = content.split(/[.\n]/)[0].trim();
+  if (firstLine.length <= 60) return firstLine;
+  return firstLine.slice(0, 57) + "...";
+}
+
 export async function fetchNotes(maxResults = 50): Promise<Note[]> {
-  const data = await get<SearchResult[]>("/api/notes", {
+  const data = await get<NotesApiResponse>("/api/notes", {
     maxResults: String(maxResults),
   });
-  return (Array.isArray(data) ? data : []).map(searchResultToNote);
-}
 
-export async function fetchNote(noteId: string): Promise<Note> {
-  return get<Note>(`/api/notes/${encodeURIComponent(noteId)}`);
-}
+  // Handle refactored format (array of notes)
+  if (data.notes && Array.isArray(data.notes)) {
+    return data.notes.map((r) => ({
+      id: r.noteId,
+      title: r.title,
+      snippet: r.snippet,
+      notebookId: r.notebookId,
+      created: r.created,
+      updated: r.updated,
+    }));
+  }
 
-export async function createNote(params: {
-  title: string;
-  content: string;
-  format?: string;
-  notebookId?: string;
-  tagIds?: string[];
-}): Promise<Note> {
-  return post<Note>("/api/notes", params);
-}
+  // Handle current deployed format (semanticHits)
+  if (data.semanticHits && Array.isArray(data.semanticHits)) {
+    return data.semanticHits.map((hit) => ({
+      id: hit.noteGuid,
+      title: deriveTitle(hit.chunkContent),
+      snippet: hit.chunkContent,
+    }));
+  }
 
-export async function updateNote(
-  noteId: string,
-  params: { title?: string; content?: string; format?: string; tagIds?: string[] }
-): Promise<Note> {
-  return put<Note>(`/api/notes/${encodeURIComponent(noteId)}`, params);
-}
-
-export async function deleteNote(noteId: string): Promise<void> {
-  return del(`/api/notes/${encodeURIComponent(noteId)}`);
+  return [];
 }
 
 // ─── Notebooks ──────────────────────────────────────────────
 
 export async function fetchNotebooks(): Promise<Notebook[]> {
-  const data = await get<Notebook[]>("/api/notebooks");
-  return Array.isArray(data) ? data : [];
-}
-
-export async function fetchNotebook(notebookId: string): Promise<Notebook> {
-  return get<Notebook>(`/api/notebooks/${encodeURIComponent(notebookId)}`);
+  try {
+    const data = await get<Notebook[] | { notebooks: Notebook[] }>("/api/notebooks");
+    if (Array.isArray(data)) return data;
+    if ("notebooks" in data) return data.notebooks;
+    return [];
+  } catch {
+    return []; // endpoint not available yet
+  }
 }
 
 // ─── Tags ───────────────────────────────────────────────────
 
 export async function fetchTags(): Promise<Tag[]> {
-  const data = await get<Tag[]>("/api/tags");
-  return Array.isArray(data) ? data : [];
+  try {
+    const data = await get<Tag[] | { tags: Tag[] }>("/api/tags");
+    if (Array.isArray(data)) return data;
+    if ("tags" in data) return data.tags;
+    return [];
+  } catch {
+    return []; // endpoint not available yet
+  }
 }
 
 // ─── Search ─────────────────────────────────────────────────
@@ -128,9 +105,22 @@ export async function searchNotes(
   query: string,
   maxResults = 20
 ): Promise<Note[]> {
-  const data = await get<SearchResult[]>("/api/search", {
-    q: query,
-    maxResults: String(maxResults),
-  });
-  return (Array.isArray(data) ? data : []).map(searchResultToNote);
+  try {
+    const data = await get<NotesApiResponse>("/api/search", {
+      q: query,
+      maxResults: String(maxResults),
+    });
+
+    if (data.semanticHits) {
+      return data.semanticHits.map((hit) => ({
+        id: hit.noteGuid,
+        title: deriveTitle(hit.chunkContent),
+        snippet: hit.chunkContent,
+      }));
+    }
+
+    return [];
+  } catch {
+    return [];
+  }
 }
